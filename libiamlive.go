@@ -686,7 +686,7 @@ func Parse(req *http.Request, body []byte, respCode int) {
 		}
 	}
 
-	if strings.HasPrefix(hostSplit[len(hostSplit)-3], "s3-") { // bucketname."s3-us-west-2".amazonaws.com
+	if len(hostSplit) > 3 && strings.HasPrefix(hostSplit[len(hostSplit)-3], "s3-") { // bucketname."s3-us-west-2".amazonaws.com
 		hostSplit[len(hostSplit)-3] = hostSplit[len(hostSplit)-3][3:]    // strip s3-
 		hostSplit = append(hostSplit, "")                                // make room
 		copy(hostSplit[len(hostSplit)-3:], hostSplit[len(hostSplit)-4:]) // shift over
