@@ -663,7 +663,7 @@ func resolvePropertyName(obj ServiceStructure, searchProp string, path string, l
 	return ""
 }
 
-func ParseAWSRequest(req *http.Request, body []byte, respCode int, entry *Entry) {
+func Parse(req *http.Request, body []byte, respCode int) {
 	host := req.Host
 	host = strings.TrimSuffix(host, ".cn")
 	uri := req.RequestURI
@@ -1024,7 +1024,7 @@ func ParseAWSRequest(req *http.Request, body []byte, respCode int, entry *Entry)
 		service = selectedCandidate.Service
 	}
 
-	*entry = Entry{
+	callLog = append(callLog, Entry{
 		Region:              region,
 		Type:                "ProxyCall",
 		Service:             service,
@@ -1035,5 +1035,5 @@ func ParseAWSRequest(req *http.Request, body []byte, respCode int, entry *Entry)
 		AccessKey:           accessKey,
 		SessionToken:        sessionToken,
 		Host:                host,
-	}
+	})
 }
