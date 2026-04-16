@@ -1,8 +1,11 @@
 package libiamlive
 
 import (
+	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -10,8 +13,14 @@ import (
 	"sort"
 	"strings"
 
-	mxj "github.com/clbanning/mxj/v2"
+	"github.com/clbanning/mxj/v2"
 )
+
+//go:embed iam_definition.json
+var bIAMSAR []byte
+
+//go:embed map.json
+var bIAMMap []byte
 
 type ServiceStructure struct {
 	Required     []string                    `json:"required"`
@@ -21,6 +30,7 @@ type ServiceStructure struct {
 	Members      map[string]ServiceStructure `json:"members"`
 	LocationName string                      `json:"locationName"`
 	QueryName    string                      `json:"queryName"`
+	Streaming    bool                        `json:"streaming"`
 }
 
 type ServiceDefinitionMetadata struct {
@@ -77,8 +87,6 @@ type Entry struct {
 	SessionToken        string `json:"SessionToken"`
 	Host                string `json:"_Host"`
 }
-
-var callLog []Entry
 
 // Statement is a single statement within an IAM policy
 type Statement struct {
@@ -344,6 +352,55 @@ type iamDefPrivilege struct {
 
 var iamDef []iamDefService
 
+//go:embed apis/*
+var serviceFiles embed.FS
+
+func init() {
+	if err := json.Unmarshal(bIAMSAR, &iamDef); err != nil {
+		panic(err)
+	}
+
+	if err := json.Unmarshal(bIAMMap, &iamMap); err != nil {
+		panic(err)
+	}
+
+	serviceDirs, err := serviceFiles.ReadDir("apis")
+	if err != nil {
+		panic(err)
+	}
+
+	for _, serviceEntry := range serviceDirs {
+		versionDirs, err := serviceFiles.ReadDir("apis/" + serviceEntry.Name())
+		if err != nil {
+			panic(err)
+		}
+
+		latestDir := ""
+		for _, versionEntry := range versionDirs {
+			if latestDir == "" || versionEntry.Name() > latestDir {
+				latestDir = versionEntry.Name()
+			}
+		}
+
+		file, err := serviceFiles.Open("apis/" + serviceEntry.Name() + "/" + latestDir + "/api-2.json")
+		if err != nil {
+			panic(err)
+		}
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			panic(err)
+		}
+
+		var def ServiceDefinition
+		if json.Unmarshal(data, &def) != nil {
+			panic(err)
+		}
+
+		serviceDefinitions = append(serviceDefinitions, def)
+	}
+}
+
 func getStatementsForProxyCall(call Entry) (statements []Statement) {
 	lowerPriv := strings.ToLower(fmt.Sprintf("%s.%s", call.Service, call.Method))
 
@@ -534,17 +591,13 @@ func aggregatePolicy(policy IAMPolicy) IAMPolicy {
 	return policy
 }
 
-func GetPolicyDocument() []byte {
+func GetPolicyDocument(callLog []Entry) []byte {
 	policy := IAMPolicy{
 		Version:   "2012-10-17",
 		Statement: []Statement{},
 	}
 
 	for _, entry := range callLog {
-		if entry.FinalHTTPStatusCode >= 200 && entry.FinalHTTPStatusCode <= 299 {
-			continue
-		}
-
 		policy.Statement = append(policy.Statement, getStatementsForProxyCall(entry)...)
 	}
 
@@ -663,16 +716,16 @@ func resolvePropertyName(obj ServiceStructure, searchProp string, path string, l
 	return ""
 }
 
-func Parse(req *http.Request, body []byte, respCode int) {
+func Parse(req *http.Request, body []byte, respCode int, entry *Entry) error {
 	host := req.Host
 	host = strings.TrimSuffix(host, ".cn")
-	uri := req.RequestURI
+	uri := req.URL.RequestURI()
 
 	var endpointUriPrefix string
 	var service string
 
 	var serviceDef ServiceDefinition
-	hostSplit := strings.Split(host, ".")
+	endpointPrefix, _, _ := strings.Cut(host, ".")
 
 	uriparams := make(map[string]string)
 	params := make(map[string][]string)
@@ -680,312 +733,271 @@ func Parse(req *http.Request, body []byte, respCode int) {
 	actionMatch := false
 	var selectedCandidate ActionCandidate
 
-	if len(hostSplit) == 4 {
-		if hostSplit[0] == "s3express-control" {
-			hostSplit[0] = "s3"
-		}
-	}
+	for _, serviceDefinition := range serviceDefinitions {
+		if serviceDefinition.Metadata.EndpointPrefix == endpointPrefix { // TODO: Ensure latest version
+			serviceDef = serviceDefinition
 
-	if len(hostSplit) > 3 && strings.HasPrefix(hostSplit[len(hostSplit)-3], "s3-") { // bucketname."s3-us-west-2".amazonaws.com
-		hostSplit[len(hostSplit)-3] = hostSplit[len(hostSplit)-3][3:]    // strip s3-
-		hostSplit = append(hostSplit, "")                                // make room
-		copy(hostSplit[len(hostSplit)-3:], hostSplit[len(hostSplit)-4:]) // shift over
-		hostSplit[len(hostSplit)-4] = "s3"                               // insert s3
-	}
-
-	if len(hostSplit) == 5 {
-		if strings.HasPrefix(hostSplit[1], "s3express-") { // bucketname--usw2-az1--x-s3."s3express-usw2-az1".ap-southeast-2.amazonaws.com
-			hostSplit[1] = "s3"
-		}
-	}
-
-	if hostSplit[len(hostSplit)-1] == "com" && hostSplit[len(hostSplit)-2] == "amazonaws" {
-		endpointPrefix := hostSplit[len(hostSplit)-3] // "s3".amazonaws.com
-		if endpointPrefix == "s3" && len(hostSplit) > 3 {
-			endpointUriPrefix = strings.Join(hostSplit[:len(hostSplit)-3], ".") // "bucket.name".s3.amazonaws.com
-		} else {
-			if len(hostSplit) > 3 {
-				endpointPrefix = hostSplit[len(hostSplit)-4] // "s3".us-east-1.amazonaws.com
+			// Doc: https://github.com/aws/aws-sdk-js/blob/54f8555bd94d33a1754a44a35286f1d9e31c28a3/lib/model/api.js#L41
+			service = serviceDef.Metadata.ServiceAbbreviation
+			if service == "" {
+				service = serviceDef.Metadata.ServiceFullName
 			}
-			if len(hostSplit) > 4 {
-				if endpointPrefix == "dualstack" {
-					endpointPrefix = hostSplit[len(hostSplit)-5] // "s3".dualstack.us-east-1.amazonaws.com
-					if len(hostSplit) > 5 {
-						endpointUriPrefix = strings.Join(hostSplit[:len(hostSplit)-5], ".") // "bucket.name".s3.dualstack.us-east-1.amazonaws.com
-					}
-				} else if endpointPrefix == "ecr" { // api.ecr.us-east-1.amazonaws.com
-					endpointPrefix = "api.ecr"
-				} else {
-					endpointUriPrefix = strings.Join(hostSplit[:len(hostSplit)-4], ".") // "bucket.name".s3.us-east-1.amazonaws.com
-				}
+			service = regexp.MustCompile(`(^Amazon|AWS\s*|\(.*|\s+|\W+)`).ReplaceAllString(service, "")
+			if service == "ElasticLoadBalancing" || service == "ElasticLoadBalancingv2" {
+				service = "ELB"
 			}
-		}
+			if service == "CognitoIdentityProvider" {
+				service = "CognitoIdentityServiceProvider"
+			}
+			if service == "AgentsforAmazonBedrockRuntime" {
+				service = "BedrockAgentRuntime"
+			}
 
-		for _, serviceDefinition := range serviceDefinitions {
-			if serviceDefinition.Metadata.EndpointPrefix == endpointPrefix { // TODO: Ensure latest version
-				serviceDef = serviceDefinition
+			if serviceDef.Metadata.Protocol == "json" {
+				// JSON schema
+				var bodyJSON interface{}
+				err := json.Unmarshal(body, &bodyJSON)
 
-				// Doc: https://github.com/aws/aws-sdk-js/blob/54f8555bd94d33a1754a44a35286f1d9e31c28a3/lib/model/api.js#L41
-				service = serviceDef.Metadata.ServiceAbbreviation
-				if service == "" {
-					service = serviceDef.Metadata.ServiceFullName
-				}
-				service = regexp.MustCompile(`(^Amazon|AWS\s*|\(.*|\s+|\W+)`).ReplaceAllString(service, "")
-				if service == "ElasticLoadBalancing" || service == "ElasticLoadBalancingv2" {
-					service = "ELB"
-				}
-				if service == "CognitoIdentityProvider" {
-					service = "CognitoIdentityServiceProvider"
-				}
-				if service == "AgentsforAmazonBedrockRuntime" {
-					service = "BedrockAgentRuntime"
-				}
-
-				if serviceDef.Metadata.Protocol == "json" {
-					// JSON schema
-					var bodyJSON interface{}
-					err := json.Unmarshal(body, &bodyJSON)
-
-					if err == nil {
-						amzTargetHeader := req.Header.Get("X-Amz-Target")
-						if amzTargetHeader != "" {
-							action = strings.Split(amzTargetHeader, ".")[1]
-							flatten(true, params, bodyJSON, "")
-						} else {
-							return
-						}
+				if err == nil {
+					amzTargetHeader := req.Header.Get("X-Amz-Target")
+					if amzTargetHeader != "" {
+						action = strings.Split(amzTargetHeader, ".")[1]
+						flatten(true, params, bodyJSON, "")
 					} else {
-						return
+						return errors.New("no X-Amz-Target header")
 					}
-				} else if serviceDef.Metadata.Protocol == "ec2" || serviceDef.Metadata.Protocol == "query" {
-					// URL param schema in body
-					vals, err := url.ParseQuery(string(body))
-					if err != nil {
-						return
-					}
+				} else {
+					return fmt.Errorf("failed to unmarshal json body: %w", err)
+				}
+			} else if serviceDef.Metadata.Protocol == "ec2" || serviceDef.Metadata.Protocol == "query" {
+				// URL param schema in body
+				vals, err := url.ParseQuery(string(body))
+				if err != nil {
+					return fmt.Errorf("failed to parse query: %w", err)
+				}
 
-					if len(vals["Action"]) != 1 || len(vals["Version"]) != 1 {
-						return
-					}
-					action = vals["Action"][0]
-					if service == "ELB" && vals["Version"][0] != "2012-06-01" { // exception
-						service = "ELBv2"
-						for _, serviceDefinition := range serviceDefinitions {
-							if serviceDefinition.Metadata.ServiceAbbreviation == "Elastic Load Balancing v2" {
-								serviceDef = serviceDefinition
-							}
+				if len(vals["Action"]) != 1 || len(vals["Version"]) != 1 {
+					return errors.New("missing Action or Version")
+				}
+				action = vals["Action"][0]
+				if service == "ELB" && vals["Version"][0] != "2012-06-01" { // exception
+					service = "ELBv2"
+					for _, serviceDefinition := range serviceDefinitions {
+						if serviceDefinition.Metadata.ServiceAbbreviation == "Elastic Load Balancing v2" {
+							serviceDef = serviceDefinition
 						}
 					}
+				}
 
-					if serviceDef.Operations[action].Input.Type == "structure" {
-						for k, v := range vals {
-							if k != "Action" && k != "Version" {
-								normalizedK := regexp.MustCompile(`\.member\.[0-9]+`).ReplaceAllString(k, "[]")
-								normalizedK = regexp.MustCompile(`\.[0-9]+`).ReplaceAllString(normalizedK, "[]")
+				if serviceDef.Operations[action].Input.Type == "structure" {
+					for k, v := range vals {
+						if k != "Action" && k != "Version" {
+							normalizedK := regexp.MustCompile(`\.member\.[0-9]+`).ReplaceAllString(k, "[]")
+							normalizedK = regexp.MustCompile(`\.[0-9]+`).ReplaceAllString(normalizedK, "[]")
 
-								resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, normalizedK, "", "", serviceDef.Shapes)
-								if resolvedPropertyName != "" {
-									normalizedK = resolvedPropertyName
-								}
-
-								if len(params[normalizedK]) > 0 {
-									params[normalizedK] = append(params[normalizedK], v...)
-								} else {
-									params[normalizedK] = v
-								}
+							resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, normalizedK, "", "", serviceDef.Shapes)
+							if resolvedPropertyName != "" {
+								normalizedK = resolvedPropertyName
 							}
-						}
-					}
-				} else if serviceDef.Metadata.Protocol == "rest-json" || serviceDef.Metadata.Protocol == "rest-xml" {
-					// URL param schema
-					urlobj, err := url.ParseRequestURI(uri)
-					if err != nil {
-						return
-					}
-					vals := urlobj.Query()
 
-					actionCandidates := []ActionCandidate{}
-
-					// path part
-				OperationLoop:
-					for operationName, operation := range serviceDef.Operations {
-						path := urlobj.Path
-						if serviceDef.Metadata.EndpointPrefix == "s3" && strings.HasPrefix(operation.Http.RequestURI, "/{Bucket}") && endpointUriPrefix != "" { // https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#VirtualHostingSpecifyBucket
-							if len(urlobj.Path) > 1 {
-								path = "/" + endpointUriPrefix + "/" + urlobj.Path[1:]
+							if len(params[normalizedK]) > 0 {
+								params[normalizedK] = append(params[normalizedK], v...)
 							} else {
-								path = "/" + endpointUriPrefix
+								params[normalizedK] = v
 							}
 						}
-						if operation.Http.RequestURI == "" || operation.Http.RequestURI[0] != '/' {
-							operation.Http.RequestURI = "/" + operation.Http.RequestURI
+					}
+				}
+			} else if serviceDef.Metadata.Protocol == "rest-json" || serviceDef.Metadata.Protocol == "rest-xml" {
+				// URL param schema
+				urlobj, err := url.ParseRequestURI(uri)
+				if err != nil {
+					return fmt.Errorf("failed to parse uri: %w", err)
+				}
+				vals := urlobj.Query()
+
+				actionCandidates := []ActionCandidate{}
+
+				// path part
+			OperationLoop:
+				for operationName, operation := range serviceDef.Operations {
+					path := urlobj.Path
+					if serviceDef.Metadata.EndpointPrefix == "s3" && strings.HasPrefix(operation.Http.RequestURI, "/{Bucket}") && endpointUriPrefix != "" { // https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#VirtualHostingSpecifyBucket
+						if len(urlobj.Path) > 1 {
+							path = "/" + endpointUriPrefix + "/" + urlobj.Path[1:]
+						} else {
+							path = "/" + endpointUriPrefix
+						}
+					}
+					if operation.Http.RequestURI == "" || operation.Http.RequestURI[0] != '/' {
+						operation.Http.RequestURI = "/" + operation.Http.RequestURI
+					}
+
+					if strings.Contains(operation.Http.RequestURI, "?") {
+						path += "?"
+
+						operationurlobj, err := url.ParseRequestURI(operation.Http.RequestURI)
+						if err != nil {
+							continue
 						}
 
-						if strings.Contains(operation.Http.RequestURI, "?") {
-							path += "?"
-
-							operationurlobj, err := url.ParseRequestURI(operation.Http.RequestURI)
-							if err != nil {
-								continue
-							}
-
-							operationquery := operationurlobj.Query()
-							for operationquerykey, operationqueryvalue := range operationquery {
-								if _, ok := vals[operationquerykey]; ok {
-									if operationqueryvalue[0] == "" {
-										path += operationquerykey + "&"
-									} else if len(vals[operationquerykey]) > 0 {
-										path += operationquerykey + "=" + vals[operationquerykey][0] + "&"
-									} else {
-										continue OperationLoop
-									}
+						operationquery := operationurlobj.Query()
+						for operationquerykey, operationqueryvalue := range operationquery {
+							if _, ok := vals[operationquerykey]; ok {
+								if operationqueryvalue[0] == "" {
+									path += operationquerykey + "&"
+								} else if len(vals[operationquerykey]) > 0 {
+									path += operationquerykey + "=" + vals[operationquerykey][0] + "&"
 								} else {
 									continue OperationLoop
 								}
-							}
-
-							if path[len(path)-1] == '&' {
-								path = path[:len(path)-1]
+							} else {
+								continue OperationLoop
 							}
 						}
 
-						templateMatches := regexp.MustCompile(`{([^}]+?)\+?}`).FindAllStringSubmatch(operation.Http.RequestURI, -1)
-						regexStr := regexp.MustCompile(`\\{([^}]+?\\\+)\\}`).ReplaceAllString(regexp.QuoteMeta(operation.Http.RequestURI), `([^?]+)`) // {Key+}
-						regexStr = fmt.Sprintf("^%s$", regexp.MustCompile(`\\{(.+?)\\}`).ReplaceAllString(regexStr, `([^/?]+?)`))                     // {Bucket}
-						pathMatchSuccess := regexp.MustCompile(regexStr).Match([]byte(path))
+						if path[len(path)-1] == '&' {
+							path = path[:len(path)-1]
+						}
+					}
 
-						if operation.Http.Method == "" {
-							operation.Http.Method = "POST"
+					templateMatches := regexp.MustCompile(`{([^}]+?)\+?}`).FindAllStringSubmatch(operation.Http.RequestURI, -1)
+					regexStr := regexp.MustCompile(`\\{([^}]+?\\\+)\\}`).ReplaceAllString(regexp.QuoteMeta(operation.Http.RequestURI), `([^?]+)`) // {Key+}
+					regexStr = fmt.Sprintf("^%s$", regexp.MustCompile(`\\{(.+?)\\}`).ReplaceAllString(regexStr, `([^/?]+?)`))                     // {Bucket}
+					pathMatchSuccess := regexp.MustCompile(regexStr).Match([]byte(path))
+
+					if operation.Http.Method == "" {
+						operation.Http.Method = "POST"
+					}
+
+					if operation.Http.Method == req.Method && pathMatchSuccess {
+						action = operationName
+						uriparams = map[string]string{}
+
+						pathMatches := regexp.MustCompile(regexStr).FindAllStringSubmatch(path, -1)
+
+						if len(pathMatches) > 0 && len(templateMatches) > 0 && len(templateMatches) == len(pathMatches[0])-1 {
+							for i := 0; i < len(templateMatches); i++ {
+								uriparams[templateMatches[i][1]] = pathMatches[0][1:][i]
+							}
 						}
 
-						if operation.Http.Method == req.Method && pathMatchSuccess {
-							action = operationName
-							uriparams = map[string]string{}
+						// query part
+						for k, v := range vals {
+							normalizedK := regexp.MustCompile(`\.member\.[0-9]+`).ReplaceAllString(k, "[]")
+							normalizedK = regexp.MustCompile(`\.[0-9]+`).ReplaceAllString(normalizedK, "[]")
 
-							pathMatches := regexp.MustCompile(regexStr).FindAllStringSubmatch(path, -1)
-
-							if len(pathMatches) > 0 && len(templateMatches) > 0 && len(templateMatches) == len(pathMatches[0])-1 {
-								for i := 0; i < len(templateMatches); i++ {
-									uriparams[templateMatches[i][1]] = pathMatches[0][1:][i]
-								}
+							resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, normalizedK, "", "", serviceDef.Shapes)
+							if resolvedPropertyName != "" {
+								normalizedK = resolvedPropertyName
+							} else {
+								// continue // Skipping just in case
 							}
 
-							// query part
-							for k, v := range vals {
-								normalizedK := regexp.MustCompile(`\.member\.[0-9]+`).ReplaceAllString(k, "[]")
-								normalizedK = regexp.MustCompile(`\.[0-9]+`).ReplaceAllString(normalizedK, "[]")
+							if len(params[normalizedK]) > 0 {
+								params[normalizedK] = append(params[normalizedK], v...)
+							} else {
+								params[normalizedK] = v
+							}
+						}
 
-								resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, normalizedK, "", "", serviceDef.Shapes)
-								if resolvedPropertyName != "" {
-									normalizedK = resolvedPropertyName
-								} else {
-									// continue // Skipping just in case
-								}
-
-								if len(params[normalizedK]) > 0 {
-									params[normalizedK] = append(params[normalizedK], v...)
-								} else {
-									params[normalizedK] = v
-								}
+						// header part
+						for k, v := range req.Header {
+							resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, k, "", "", serviceDef.Shapes)
+							if resolvedPropertyName != "" {
+								k = resolvedPropertyName
+							} else {
+								continue
 							}
 
-							// header part
-							for k, v := range req.Header {
-								resolvedPropertyName := resolvePropertyName(serviceDef.Operations[action].Input, k, "", "", serviceDef.Shapes)
-								if resolvedPropertyName != "" {
-									k = resolvedPropertyName
-								} else {
-									continue
-								}
-
-								if len(params[k]) > 0 {
-									params[k] = append(params[k], v...)
-								} else {
-									params[k] = v
-								}
+							if len(params[k]) > 0 {
+								params[k] = append(params[k], v...)
+							} else {
+								params[k] = v
 							}
+						}
 
-							// body part
-							if len(body) > 0 {
+						// body part
+						if len(body) > 0 {
+							inputDef := serviceDef.Shapes[serviceDef.Operations[action].Input.Shape]
+
+							if bodyDef, ok := inputDef.Members["Body"]; ok && !bodyDef.Streaming {
 								if serviceDef.Metadata.Protocol == "rest-json" {
 									var bodyJSON interface{}
 									err := json.Unmarshal(body, &bodyJSON)
 									if err != nil {
-										return
+										return fmt.Errorf("failed to unmarshal rest-json response: %w", err)
 									}
-
 									flatten(true, params, bodyJSON, "")
-								} else {
+								} else if serviceDef.Metadata.Protocol == "rest-xml" {
 									mxjXML, err := mxj.NewMapXml(body)
 									bodyXML := map[string]interface{}(mxjXML)
 									if err != nil {
-										// last chance effort to parse as JSON
-										err := json.Unmarshal(body, &bodyXML)
-										if err != nil {
-											return
-										}
+										return fmt.Errorf("failed to unmarshal rest-xml response: %w", err)
 									}
-
 									flatten(true, params, bodyXML, "")
+								} else {
+									return fmt.Errorf("unknown protocol: %q", serviceDef.Metadata.Protocol)
 								}
 							}
-
-							actionCandidates = append(actionCandidates, ActionCandidate{
-								Path:      path,
-								Action:    action,
-								Params:    params,
-								URIParams: uriparams,
-								Operation: operation,
-								Service:   service,
-							})
 						}
-					}
 
-					// select candidate
-					var selectedActionCandidate ActionCandidate
-				ActionCandidateLoop:
-					for _, actionCandidate := range actionCandidates {
-					RequiredParamLoop:
-						for _, requiredParam := range actionCandidate.Operation.Input.Required { // check input requirements
-							for k := range actionCandidate.Params {
-								if k == requiredParam || (len(k) >= len(requiredParam)+2 && k[:len(requiredParam)+2] == requiredParam+"[]") || (len(k) >= len(requiredParam)+1 && k[:len(requiredParam)+1] == requiredParam+".") { // equals, or is array, or is map
-									continue RequiredParamLoop
-								}
+						actionCandidates = append(actionCandidates, ActionCandidate{
+							Path:      path,
+							Action:    action,
+							Params:    params,
+							URIParams: uriparams,
+							Operation: operation,
+							Service:   service,
+						})
+					}
+				}
+
+				// select candidate
+				var selectedActionCandidate ActionCandidate
+			ActionCandidateLoop:
+				for _, actionCandidate := range actionCandidates {
+				RequiredParamLoop:
+					for _, requiredParam := range actionCandidate.Operation.Input.Required { // check input requirements
+						for k := range actionCandidate.Params {
+							if k == requiredParam || (len(k) >= len(requiredParam)+2 && k[:len(requiredParam)+2] == requiredParam+"[]") || (len(k) >= len(requiredParam)+1 && k[:len(requiredParam)+1] == requiredParam+".") { // equals, or is array, or is map
+								continue RequiredParamLoop
 							}
-							for k := range actionCandidate.URIParams {
-								if k == requiredParam || (len(k) >= len(requiredParam)+2 && k[:len(requiredParam)+2] == requiredParam+"[]") || (len(k) >= len(requiredParam)+1 && k[:len(requiredParam)+1] == requiredParam+".") { // equals, or is array, or is map
-									continue RequiredParamLoop
-								}
+						}
+						for k := range actionCandidate.URIParams {
+							if k == requiredParam || (len(k) >= len(requiredParam)+2 && k[:len(requiredParam)+2] == requiredParam+"[]") || (len(k) >= len(requiredParam)+1 && k[:len(requiredParam)+1] == requiredParam+".") { // equals, or is array, or is map
+								continue RequiredParamLoop
 							}
-							continue ActionCandidateLoop // requirements not met
 						}
-						if selectedActionCandidate.Action == "" { // first one
-							selectedActionCandidate = actionCandidate
-							continue
-						}
-						if len(actionCandidate.Path) > len(selectedActionCandidate.Path) { // longer path wins
-							selectedActionCandidate = actionCandidate
-							continue
-						}
-						if len(actionCandidate.Operation.Input.Required) > len(selectedActionCandidate.Operation.Input.Required) { // more requirements wins
-							selectedActionCandidate = actionCandidate
-							continue
-						}
+						continue ActionCandidateLoop // requirements not met
 					}
+					if selectedActionCandidate.Action == "" { // first one
+						selectedActionCandidate = actionCandidate
+						continue
+					}
+					if len(actionCandidate.Path) > len(selectedActionCandidate.Path) { // longer path wins
+						selectedActionCandidate = actionCandidate
+						continue
+					}
+					if len(actionCandidate.Operation.Input.Required) > len(selectedActionCandidate.Operation.Input.Required) { // more requirements wins
+						selectedActionCandidate = actionCandidate
+						continue
+					}
+				}
 
-					if !actionMatch && selectedActionCandidate.Action != "" {
-						selectedCandidate = selectedActionCandidate
-						actionMatch = true
-					}
+				if !actionMatch && selectedActionCandidate.Action != "" {
+					selectedCandidate = selectedActionCandidate
+					actionMatch = true
 				}
 			}
 		}
-	} else {
-		return
 	}
 
 	if action == "" {
-		return
+		return errors.New("no action")
+	}
+	if service == "" {
+		return errors.New("no service")
 	}
 
 	region := "us-east-1"
@@ -1024,7 +1036,7 @@ func Parse(req *http.Request, body []byte, respCode int) {
 		service = selectedCandidate.Service
 	}
 
-	callLog = append(callLog, Entry{
+	*entry = Entry{
 		Region:              region,
 		Type:                "ProxyCall",
 		Service:             service,
@@ -1035,5 +1047,7 @@ func Parse(req *http.Request, body []byte, respCode int) {
 		AccessKey:           accessKey,
 		SessionToken:        sessionToken,
 		Host:                host,
-	})
+	}
+
+	return nil
 }
