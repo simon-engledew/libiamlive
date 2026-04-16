@@ -1,6 +1,7 @@
 package libiamlive
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"testing"
 
 	"github.com/clbanning/mxj/v2"
 )
@@ -1046,4 +1048,50 @@ func Parse(req *http.Request, body []byte, respCode int, entry *Entry) error {
 	}
 
 	return nil
+}
+
+type HTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type PolicyInterceptor struct {
+	HTTPClient
+	callLog []Entry
+	Host    string
+}
+
+func (i *PolicyInterceptor) Do(req *http.Request) (*http.Response, error) {
+	var buf []byte
+	var err error
+	if req.Body != nil {
+		buf, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if err := req.Body.Close(); err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(buf))
+	}
+	resp, err := i.HTTPClient.Do(req)
+	if err != nil {
+		return resp, err
+	}
+	req.Host = i.Host
+	var entry Entry
+	if err := Parse(req, buf, resp.StatusCode, &entry); err != nil {
+		panic(err)
+	}
+	i.callLog = append(i.callLog, entry)
+	return resp, err
+}
+
+func (i *PolicyInterceptor) LogPolicy(tb testing.TB) {
+	tb.Helper()
+	doc, err := GetPolicyDocument(i.callLog)
+	if err != nil {
+		tb.Log(err)
+		tb.Fail()
+	}
+	tb.Log(string(doc))
 }
