@@ -591,7 +591,7 @@ func aggregatePolicy(policy IAMPolicy) IAMPolicy {
 	return policy
 }
 
-func GetPolicyDocument(callLog []Entry) []byte {
+func GetPolicyDocument(callLog []Entry) ([]byte, error) {
 	policy := IAMPolicy{
 		Version:   "2012-10-17",
 		Statement: []Statement{},
@@ -610,11 +610,7 @@ func GetPolicyDocument(callLog []Entry) []byte {
 		}
 	}
 
-	doc, err := json.MarshalIndent(policy, "", "    ")
-	if err != nil {
-		panic(err)
-	}
-	return doc
+	return json.MarshalIndent(policy, "", "    ")
 }
 
 func flatten(top bool, flatMap map[string][]string, nested interface{}, prefix string) error {
