@@ -2,6 +2,7 @@ package libiamlive
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -1056,13 +1057,20 @@ type HTTPClient interface {
 
 type PolicyInterceptor struct {
 	HTTPClient
-	callLog   []Entry
-	Host      string
-	Recording bool
+	callLog []Entry
+	Host    string
+}
+
+type contextKey string
+
+var kIgnore contextKey = "ignore"
+
+func IgnoreRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, kIgnore, true)
 }
 
 func (i *PolicyInterceptor) Do(req *http.Request) (*http.Response, error) {
-	if !i.Recording {
+	if _, ok := req.Context().Value(kIgnore).(bool); ok {
 		return i.HTTPClient.Do(req)
 	}
 	var buf []byte
