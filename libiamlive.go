@@ -1056,11 +1056,15 @@ type HTTPClient interface {
 
 type PolicyInterceptor struct {
 	HTTPClient
-	callLog []Entry
-	Host    string
+	callLog   []Entry
+	Host      string
+	Recording bool
 }
 
 func (i *PolicyInterceptor) Do(req *http.Request) (*http.Response, error) {
+	if !i.Recording {
+		return i.HTTPClient.Do(req)
+	}
 	var buf []byte
 	var err error
 	if req.Body != nil {
